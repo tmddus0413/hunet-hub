@@ -713,7 +713,8 @@ footer { position:relative; z-index:2; text-align:center; padding:28px 40px 44px
 ═══════════════════════════════════════════════ */
 import { initializeApp }
   from "https://www.gstatic.com/firebasejs/12.11.0/firebase-app.js";
-import { getFirestore, doc, getDoc, setDoc, onSnapshot }
+import { getFirestore, doc, getDoc, setDoc, onSnapshot,
+         collection, addDoc, getDocs, deleteDoc, query, where }
   from "https://www.gstatic.com/firebasejs/12.11.0/firebase-firestore.js";
 
 const firebaseConfig = {
@@ -745,7 +746,9 @@ let currentGalleryCardId  = null;
 let editingGSectionId     = null;
 
 let sections    = [];
-let galleryMeta = {};  // { cardId: { sections:[{id,name,photos:[{src,caption}]}] } }
+let galleryMeta    = {};  // { cardId: { sections:[{id,name,photos:[{photoDocId,caption}]}] } }
+let currentPhotoDocs = {};  // { photoDocId: {src, caption, ...} } — loaded when gallery opens
+// photos are stored as individual Firestore docs in 'photos' collection
 
 /* ═══════════════════════════════════════════════
    LOADING UI
@@ -789,6 +792,25 @@ async function save() {
     console.error(e);
     toast('저장 오류가 발생했습니다 ⚠️');
   }
+}
+
+// Save a single photo as its own Firestore document
+async function savePhoto(cardId, gSectionId, base64, caption) {
+  const photosCol = collection(db, 'photos');
+  const docRef = await addDoc(photosCol, {
+    cardId, gSectionId, src: base64, caption, createdAt: Date.now()
+  });
+  return docRef.id;
+}
+
+// Load all photos for a gallery card
+async function loadPhotos(cardId) {
+  const photosCol = collection(db, 'photos');
+  const q = query(photosCol, where('cardId', '==', cardId));
+  const snap = await getDocs(q);
+  const result = {};
+  snap.forEach(d => { result[d.id] = { ...d.data(), photoDocId: d.id }; });
+  return result;
 }
 
 async function load() {
@@ -1140,15 +1162,19 @@ function startCardDrag(e, cardId, secId) {
 /* ═══════════════════════════════════════════════
    GALLERY
 ═══════════════════════════════════════════════ */
-window.openGallery = function(cardId, title, desc) {
+window.openGallery = async function(cardId, title, desc) {
   currentGalleryCardId = cardId;
   if (!galleryMeta[cardId]) galleryMeta[cardId] = { sections: [] };
   document.getElementById('galleryTopbarTitle').textContent = title || '레퍼런스 갤러리';
   document.getElementById('galleryHeroTitle').textContent   = title || '레퍼런스 갤러리';
   document.getElementById('galleryHeroSub').textContent     = desc  || '현장 운영 사진 & 레퍼런스 자료';
-  renderGallerySections();
   document.getElementById('galleryPage').classList.add('show');
   document.body.style.overflow = 'hidden';
+  // Load photos from Firestore
+  showLoading('사진을 불러오는 중...');
+  currentPhotoDocs = await loadPhotos(cardId);
+  hideLoading();
+  renderGallerySections();
 };
 window.closeGallery = function() {
   document.getElementById('galleryPage').classList.remove('show');
@@ -1183,25 +1209,37 @@ function renderGallerySections() {
     container.appendChild(sec);
     const pgrid = document.getElementById('pgrid_' + gIdx);
     (gs.photos || []).forEach((photo, pIdx) => {
+      const photoData = currentPhotoDocs[photo.photoDocId] || {};
+      const src = photoData.src || '';
+      const caption = photo.caption || photoData.caption || '';
       const item = document.createElement('div');
       item.className = 'photo-item';
       item.innerHTML = `
-        <img src="${photo.src}" alt="${photo.caption||''}">
-        ${photo.caption ? `<div class="photo-caption">${photo.caption}</div>` : ''}
-        <button class="photo-del-btn" onclick="deletePhoto(${gIdx},${pIdx})">✕</button>
+        <img src="${src}" alt="${caption}">
+        ${caption ? `<div class="photo-caption">${caption}</div>` : ''}
       `;
+      const delBtn = document.createElement('button');
+      delBtn.className = 'photo-del-btn';
+      delBtn.textContent = '✕';
+      delBtn.addEventListener('click', () => deletePhoto(gIdx, pIdx, photo.photoDocId));
+      item.appendChild(delBtn);
       item.querySelector('img').addEventListener('click', ev => {
         if (ev.target.closest('.photo-del-btn')) return;
-        openLightbox(photo.src, photo.caption || '');
+        openLightbox(src, caption);
       });
       pgrid.appendChild(item);
     });
     // upload label
     const lbl = document.createElement('label');
     lbl.className = 'add-photo-label';
-    lbl.innerHTML = `<span class="add-photo-icon">＋</span><span>사진 추가</span>
-      <input type="file" accept="image/*" multiple style="display:none"
-        onchange="addPhotos(event,${gIdx})">`;
+    lbl.innerHTML = `<span class="add-photo-icon">＋</span><span>사진 추가</span>`;
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.accept = 'image/*';
+    fileInput.multiple = true;
+    fileInput.style.display = 'none';
+    fileInput.addEventListener('change', (e) => addPhotos(e, gIdx));
+    lbl.appendChild(fileInput);
     pgrid.appendChild(lbl);
   });
 }
@@ -1268,13 +1306,20 @@ function resizeImage(file, maxWidth=1200, maxHeight=1200, quality=0.82) {
 window.addPhotos = async function(e, gIdx) {
   const files = Array.from(e.target.files);
   if (!files.length) return;
-  showLoading(`사진 ${files.length}장 처리 중...`);
+  const gs = galleryMeta[currentGalleryCardId].sections[gIdx];
+  showLoading(`사진 0 / ${files.length}장 업로드 중...`);
   try {
-    for (const file of files) {
-      const base64 = await resizeImage(file);
-      galleryMeta[currentGalleryCardId].sections[gIdx].photos.push({
-        src: base64, caption: ''
-      });
+    for (let i = 0; i < files.length; i++) {
+      showLoading(`사진 ${i+1} / ${files.length}장 업로드 중...`);
+      const base64 = await resizeImage(files[i]);
+      // Save photo as individual Firestore document
+      const photoDocId = await savePhoto(
+        currentGalleryCardId, gs.id, base64, ''
+      );
+      // Store only the reference (no base64) in galleryMeta
+      gs.photos.push({ photoDocId, caption: '' });
+      // Keep in local cache
+      currentPhotoDocs[photoDocId] = { src: base64, caption: '', cardId: currentGalleryCardId, gSectionId: gs.id };
     }
     await save();
     renderGallerySections();
@@ -1286,8 +1331,15 @@ window.addPhotos = async function(e, gIdx) {
   hideLoading();
 };
 
-window.deletePhoto = async function(gIdx, pIdx) {
+window.deletePhoto = async function(gIdx, pIdx, photoDocId) {
   if (!confirm('사진을 삭제하시겠습니까?')) return;
+  // Delete the individual photo document from Firestore
+  if (photoDocId) {
+    try {
+      await deleteDoc(doc(db, 'photos', photoDocId));
+      delete currentPhotoDocs[photoDocId];
+    } catch(e) { console.warn('photo doc delete failed', e); }
+  }
   galleryMeta[currentGalleryCardId].sections[gIdx].photos.splice(pIdx, 1);
   await save(); renderGallerySections(); toast('사진이 삭제되었습니다');
 };
